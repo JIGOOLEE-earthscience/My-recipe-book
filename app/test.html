@@ -125,6 +125,12 @@ pre{background:var(--field);box-shadow:var(--in);border-radius:14px;padding:12px
     <option value="">기본</option>
     <option value="MEDIA_RESOLUTION_LOW">낮음(토큰 적음, 긴 영상용)</option>
   </select>
+  <label for="mode">요청 방식</label>
+  <select id="mode">
+    <option value="bg">백그라운드(화면 꺼도 됨)</option>
+    <option value="direct">즉시(화면 켜 둬야 함)</option>
+  </select>
+  <p class="hint">백그라운드: 구글 서버에 작업을 맡기고 결과를 나중에 받아 옴. 화면이 꺼져 연결이 끊겨도 다시 켜면 이어서 받음.</p>
   <p class="hint">키는 이 브라우저 안에만 저장됨. 다른 곳으로 보내지 않음(Google API 호출에만 씀).</p>
   <div id="settingsErr" class="err hidden"></div>
 </section>
@@ -173,7 +179,7 @@ pre{background:var(--field);box-shadow:var(--in);border-radius:14px;padding:12px
 
 <script type="module">
 import { parseVideoId, watchUrl, thumbUrl, timeLink, fetchVideoInfo, fetchAuthorComments, SegmentPlayer } from './youtube.js';
-import { listModels, loadPrompt, fillPrompt, sourceList, summarizeVideo } from './gemini.js';
+import { listModels, loadPrompt, fillPrompt, sourceList, summarizeVideo, startInteraction, waitInteraction, readInteraction } from './gemini.js';
 
 const $ = (id) => document.getElementById(id);
 const LS = 'recipeLab.';
@@ -191,6 +197,7 @@ $('gKey').value = store.get('gKey', '');
 $('yKey').value = store.get('yKey', '');
 $('sameKey').checked = store.get('sameKey', true);
 $('mediaRes').value = store.get('mediaRes', '');
+$('mode').value = store.get('mode', 'bg');
 $('yKeyBox').classList.toggle('hidden', $('sameKey').checked);
 const savedModels = store.get('models', []);
 if (savedModels.length) fillModels(savedModels, store.get('model', ''));
@@ -198,6 +205,7 @@ if (savedModels.length) fillModels(savedModels, store.get('model', ''));
 $('gKey').addEventListener('change', () => store.set('gKey', $('gKey').value.trim()));
 $('yKey').addEventListener('change', () => store.set('yKey', $('yKey').value.trim()));
 $('mediaRes').addEventListener('change', () => store.set('mediaRes', $('mediaRes').value));
+$('mode').addEventListener('change', () => store.set('mode', $('mode').value));
 $('model').addEventListener('change', () => store.set('model', $('model').value));
 $('sameKey').addEventListener('change', () => {
   store.set('sameKey', $('sameKey').checked);
@@ -252,15 +260,17 @@ function resetStages() {
   $('stages').innerHTML = STAGES.map(([k, name]) =>
     `<li id="st-${k}"><span class="dot"></span><div><div>${name}</div><div class="d"></div></div><span class="t"></span></li>`).join('');
 }
-function stage(k, state, detail = '', ms = null) {
+function stage(k, state, detail = '', ms = null, since = null) {
   const li = $(`st-${k}`);
   li.querySelector('.dot').className = `dot ${state}`;
   li.querySelector('.d').textContent = detail;
   li.querySelector('.t').textContent = ms != null ? secs(ms) : '';
   if (state === 'run') {
-    const t0 = performance.now();
+    const t0 = since ?? Date.now();
     clearInterval(liveTimer);
-    liveTimer = setInterval(() => { li.querySelector('.t').textContent = secs(performance.now() - t0); }, 500);
+    const tick = () => { li.querySelector('.t').textContent = secs(Date.now() - t0); };
+    tick();
+    liveTimer = setInterval(tick, 500);
   } else clearInterval(liveTimer);
 }
 
@@ -270,32 +280,21 @@ let wakeLock = null;
 let current = null; // 지금 보고 있는 시험 기록
 let player = null;
 
-$('stop').addEventListener('click', () => abort?.abort());
+$('stop').addEventListener('click', () => { abort?.abort(); store.set('pending', null); });
 
 $('run').addEventListener('click', async () => {
   const gKey = $('gKey').value.trim();
   const yKey = $('sameKey').checked ? gKey : $('yKey').value.trim();
   const model = $('model').value;
   const memo = $('memo').value.trim();
-  showErr('runErr', '');
   if (!gKey) return alertSettings('Gemini API 키를 넣어 주세요.');
   if (!model) return alertSettings('[목록 불러오기]로 모델을 골라 주세요.');
   store.set('gKey', gKey);
 
-  $('progressCard').classList.remove('hidden');
-  $('resultCard').classList.add('hidden');
-  resetStages();
-  $('progressCard').scrollIntoView({ behavior: 'smooth' });
-  $('run').disabled = true;
-  $('stop').classList.remove('hidden');
-  abort = new AbortController();
-  const signal = abort.signal;
-  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
-
-  const t0 = performance.now();
+  const signal = await beginRun();
   const rep = {
     at: Date.now(), url: $('url').value.trim(), videoId: null, video: null,
-    model, mediaResolution: $('mediaRes').value || '기본',
+    model, mediaResolution: $('mediaRes').value || '기본', mode: $('mode').value,
     sources: { video: true, description: false, authorComments: 0, memo: !!memo },
     timings: {}, errors: [], checks: {},
   };
@@ -353,49 +352,139 @@ $('run').addEventListener('click', async () => {
     stage('prompt', 'ok', `${prompt.length}자`);
 
     // 5. Gemini
-    stage('gemini', 'run', `${model} · 화면을 꺼도 되는지도 함께 확인해 보세요`);
+    rep.geminiStartedAt = Date.now();
+    const onBusy = (n, wait, msg) => stage('gemini', 'run', `구글 서버 혼잡(${msg.slice(0, 40)}…) → ${wait}초 뒤 다시 요청(${n}/3)`, null, rep.geminiStartedAt);
+    if (rep.mode === 'bg') {
+      stage('gemini', 'run', `${model} · 작업 맡기는 중`, null, rep.geminiStartedAt);
+      const job = await startInteraction({ key: gKey, model, videoUrl: watchUrl(id), prompt, lowRes: $('mediaRes').value === 'MEDIA_RESOLUTION_LOW', signal, onBusy });
+      rep.interactionId = job.id;
+      rep.busyRetries = job.busyRetries;
+      rep.attempts = 1;
+      store.set('pending', { rep, prompt });
+      await finishBackground(rep, prompt, gKey, signal);
+      return;
+    }
+    stage('gemini', 'run', `${model} · 즉시 방식(화면 켜 두기)`, null, rep.geminiStartedAt);
     let res;
     try {
       res = await summarizeVideo({ key: gKey, model, videoUrl: watchUrl(id), prompt, mediaResolution: $('mediaRes').value, durationSec: rep.video?.durationSec ?? null, signal,
-        onBusy: (n, wait, msg) => stage('gemini', 'run', `구글 서버 혼잡(${msg.slice(0, 40)}…) → ${wait}초 뒤 다시 요청(${n}/3)`),
+        onBusy,
       });
     } catch (e) {
       if (e.name === 'AbortError') throw e;
       stage('gemini', 'fail', `${e.message}${e.reason ? ` (${e.reason})` : ''}`);
-      if (e.rawText) $('raw').textContent = e.rawText;
       throw e;
     }
-    rep.timings.gemini = res.ms;
-    rep.usage = res.usage;
     rep.attempts = res.attempts;
     rep.busyRetries = res.busyRetries;
-    rep.finishReason = res.finishReason;
-    rep.warnings = res.warnings;
-    rep.result = { recipes: res.recipes };
-    rep.rawText = res.rawText;
-    stage('gemini', 'ok', `요청 ${res.attempts}번${res.busyRetries ? ` · 혼잡 재시도 ${res.busyRetries}번` : ''} · 토큰 ${num(res.usage.total)}`, res.ms);
-
-    // 6. 확인
-    rep.timings.total = performance.now() - t0;
-    const nSteps = res.recipes.reduce((a, r) => a + r.steps.length, 0);
-    stage('check', 'ok', `레시피 ${res.recipes.length}개 · 단계 ${nSteps}개${res.warnings.length ? ` · 주의 ${res.warnings.length}` : ''}`);
-    saveHistory(rep);
-    showResult(rep);
+    finishRep(rep, res);
   } catch (e) {
-    const msg = e.name === 'AbortError' ? '중단했어요.' : e.message;
-    showErr('runErr', msg);
-    for (const [k] of STAGES) {
-      const dot = $(`st-${k}`)?.querySelector('.dot');
-      if (dot?.classList.contains('run')) stage(k, 'fail', e.name === 'AbortError' ? '중단' : '');
-    }
+    failRun(e);
   } finally {
-    clearInterval(liveTimer);
-    $('run').disabled = false;
-    $('stop').classList.add('hidden');
-    try { await wakeLock?.release(); } catch {}
-    wakeLock = null;
+    await endRun();
   }
 });
+
+async function beginRun() {
+  showErr('runErr', '');
+  $('progressCard').classList.remove('hidden');
+  $('resultCard').classList.add('hidden');
+  resetStages();
+  $('progressCard').scrollIntoView({ behavior: 'smooth' });
+  $('run').disabled = true;
+  $('stop').classList.remove('hidden');
+  abort = new AbortController();
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  return abort.signal;
+}
+
+async function endRun() {
+  clearInterval(liveTimer);
+  $('run').disabled = false;
+  $('stop').classList.add('hidden');
+  try { await wakeLock?.release(); } catch {}
+  wakeLock = null;
+}
+
+function failRun(e) {
+  const aborted = e.name === 'AbortError';
+  showErr('runErr', aborted ? '중단했어요.' : e.message);
+  if (e.rawText) $('raw').textContent = e.rawText;
+  for (const [k] of STAGES) {
+    const dot = $(`st-${k}`)?.querySelector('.dot');
+    if (dot?.classList.contains('run')) stage(k, 'fail', aborted ? '중단' : `${e.message}${e.reason ? ` (${e.reason})` : ''}`);
+  }
+}
+
+/** Gemini 결과를 기록에 넣고 화면에 보여 줌(두 방식 공통) */
+function finishRep(rep, res) {
+  rep.timings.gemini = Date.now() - rep.geminiStartedAt;
+  rep.timings.total = Date.now() - rep.at;
+  rep.usage = res.usage;
+  rep.finishReason = res.finishReason;
+  rep.warnings = res.warnings;
+  rep.result = { recipes: res.recipes };
+  rep.rawText = res.rawText;
+  stage('gemini', 'ok', `${rep.mode === 'bg' ? '백그라운드 · ' : ''}요청 ${rep.attempts}번${rep.busyRetries ? ` · 혼잡 재시도 ${rep.busyRetries}번` : ''}${rep.connectionDrops ? ` · 연결 끊김 ${rep.connectionDrops}번` : ''} · 토큰 ${num(res.usage.total)}`, rep.timings.gemini);
+  const nSteps = res.recipes.reduce((a, r) => a + r.steps.length, 0);
+  stage('check', 'ok', `레시피 ${res.recipes.length}개 · 단계 ${nSteps}개${res.warnings.length ? ` · 주의 ${res.warnings.length}` : ''}`);
+  saveHistory(rep);
+  showResult(rep);
+}
+
+/** 백그라운드 작업이 끝날 때까지 기다려 결과 처리. 형식이 깨지면 1번 다시 맡김 */
+async function finishBackground(rep, prompt, gKey, signal) {
+  for (;;) {
+    let wasOffline = false;
+    const it = await waitInteraction({
+      key: gKey, id: rep.interactionId, signal,
+      onTick: ({ offline, checks }) => {
+        if (offline && !wasOffline) rep.connectionDrops = (rep.connectionDrops || 0) + 1;
+        wasOffline = offline;
+        stage('gemini', 'run', offline
+          ? '연결 끊김(화면 꺼짐 등) → 다시 연결되면 이어서 확인'
+          : `구글 서버에서 처리 중 · 화면 꺼도 돼요 · 확인 ${checks}번`, null, rep.geminiStartedAt);
+      },
+    });
+    try {
+      const res = readInteraction(it, { durationSec: rep.video?.durationSec ?? null });
+      store.set('pending', null);
+      finishRep(rep, res);
+      return;
+    } catch (e) {
+      if (!e.formatError || rep.attempts >= 2) {
+        store.set('pending', null);
+        throw e;
+      }
+      rep.attempts++;
+      stage('gemini', 'run', '형식 오류 → 다시 맡기는 중', null, rep.geminiStartedAt);
+      const job = await startInteraction({ key: gKey, model: rep.model, videoUrl: watchUrl(rep.videoId), prompt, lowRes: rep.mediaResolution === 'MEDIA_RESOLUTION_LOW', signal });
+      rep.interactionId = job.id;
+      store.set('pending', { rep, prompt });
+    }
+  }
+}
+
+/** 페이지를 다시 열었을 때 맡겨 둔 작업이 있으면 이어서 받기 */
+async function resumePending() {
+  const p = store.get('pending');
+  const gKey = $('gKey').value.trim();
+  if (!p?.rep?.interactionId || !gKey) return;
+  const rep = p.rep;
+  const signal = await beginRun();
+  stage('link', 'ok', rep.videoId);
+  stage('info', rep.video ? 'ok' : 'skip', rep.video ? rep.video.title : '');
+  stage('comments', rep.video ? 'ok' : 'skip', rep.video ? `${rep.sources.authorComments}개` : '');
+  stage('prompt', 'ok', '이전에 맡긴 작업 이어서 받기');
+  stage('gemini', 'run', '맡겨 둔 작업 확인 중', null, rep.geminiStartedAt);
+  try {
+    await finishBackground(rep, p.prompt, gKey, signal);
+  } catch (e) {
+    failRun(e);
+  } finally {
+    await endRun();
+  }
+}
 
 function alertSettings(msg) {
   showErr('settingsErr', msg);
@@ -556,6 +645,7 @@ $('hist').addEventListener('click', (e) => {
   if (rep) { rep.checks ||= {}; showResult(rep); }
 });
 renderHistory();
+resumePending();
 </script>
 </body>
 </html>

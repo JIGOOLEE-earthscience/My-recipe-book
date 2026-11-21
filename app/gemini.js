@@ -25,9 +25,10 @@ async function call(path, { key, method = 'GET', body, signal }) {
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error(data.error?.message || `HTTP ${res.status}`);
+    const info = (Array.isArray(data) ? data[0] : data)?.error || {};
+    const err = new Error(info.message || `HTTP ${res.status}`);
     err.status = res.status;
-    err.reason = data.error?.status || '';
+    err.reason = info.status || '';
     throw err;
   }
   return data;
@@ -240,4 +241,138 @@ function sumUsage(list) {
     for (const d of m.promptTokensDetails || []) u.byModality[d.modality] = (u.byModality[d.modality] || 0) + (d.tokenCount || 0);
   }
   return u;
+}
+
+// ---------- 백그라운드 실행(Interactions API) ----------
+// 요청을 구글 서버에 맡기고 작업 번호(id)만 받아 둠. 휴대폰 화면이 꺼져 연결이 끊겨도
+// 다시 켜졌을 때 id로 결과를 받아 올 수 있음. 저장된 작업은 유료 기준 55일 보관(문서).
+
+/** 작업 맡기기. 과부하면 기다렸다 다시. 돌려줌: 작업 id */
+export async function startInteraction({ key, model, videoUrl, prompt, lowRes, signal, onBusy }) {
+  const input = [];
+  if (videoUrl) input.push({ type: 'video', uri: videoUrl, ...(lowRes ? { resolution: 'low' } : {}) });
+  input.push({ type: 'text', text: prompt });
+  const body = { model, input, background: true };
+  let busy = 0;
+  for (;;) {
+    try {
+      const it = await call('interactions', { key, method: 'POST', body, signal });
+      if (!it.id) throw new Error('작업 번호를 받지 못했어요');
+      return { id: it.id, busyRetries: busy };
+    } catch (e) {
+      if (!isBusy(e) || busy >= BUSY_WAITS.length) throw e;
+      const wait = BUSY_WAITS[busy++];
+      onBusy?.(busy, wait, e.message);
+      await sleep(wait * 1000, signal);
+    }
+  }
+}
+
+export const getInteraction = (key, id, signal) => call(`interactions/${encodeURIComponent(id)}`, { key, signal });
+
+/** 화면이 다시 켜지면 기다리던 확인을 바로 하도록 깨우는 대기 */
+function napUntilVisible(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const done = () => {
+      clearTimeout(t);
+      document.removeEventListener('visibilitychange', onVis);
+      resolve();
+    };
+    const onVis = () => document.visibilityState === 'visible' && done();
+    const t = setTimeout(done, ms);
+    document.addEventListener('visibilitychange', onVis);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(t);
+      document.removeEventListener('visibilitychange', onVis);
+      reject(new DOMException('중단', 'AbortError'));
+    }, { once: true });
+  });
+}
+
+/**
+ * 작업이 끝날 때까지 몇 초마다 확인. 연결이 끊기면(화면 꺼짐 등) 포기하지 않고 계속 확인.
+ * onTick({ status, offline, checks })로 진행 알림. 끝난 작업 객체를 돌려줌.
+ */
+export async function waitInteraction({ key, id, signal, onTick, interval = 4000 }) {
+  let checks = 0;
+  for (;;) {
+    let it = null;
+    try {
+      it = await getInteraction(key, id, signal);
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      if (e.reason !== 'network' && !isBusy(e)) throw e; // 키 오류·작업 없음 등은 바로 실패
+      onTick?.({ status: 'offline', offline: true, checks });
+    }
+    if (it) {
+      checks++;
+      if (it.status !== 'in_progress') return it;
+      onTick?.({ status: it.status, offline: false, checks });
+    }
+    await napUntilVisible(interval, signal);
+  }
+}
+
+/** 끝난 작업에서 답 글 꺼내기 */
+export function interactionText(it) {
+  return (it.steps || [])
+    .filter((st) => st.type === 'model_output')
+    .flatMap((st) => st.content || [])
+    .filter((c) => c.type === 'text' && c.text)
+    .map((c) => c.text)
+    .join('');
+}
+
+/** 작업의 토큰 기록 → generateContent와 같은 모양 */
+export function interactionUsage(it) {
+  const u = it.usage || {};
+  const byModality = {};
+  const add = (list) => {
+    if (Array.isArray(list)) {
+      for (const x of list) {
+        const n = x.tokens ?? x.token_count ?? x.tokenCount ?? x.count ?? 0;
+        if (x.modality) byModality[String(x.modality).toUpperCase()] = (byModality[String(x.modality).toUpperCase()] || 0) + n;
+      }
+    } else if (list && typeof list === 'object') {
+      for (const [k, v] of Object.entries(list)) byModality[k.toUpperCase()] = (byModality[k.toUpperCase()] || 0) + (Number(v) || 0);
+    }
+  };
+  add(u.input_tokens_by_modality);
+  return {
+    input: u.total_input_tokens || 0,
+    output: u.total_output_tokens || 0,
+    thoughts: u.total_thought_tokens || 0,
+    total: u.total_tokens || 0,
+    byModality,
+  };
+}
+
+/** 끝난 작업 → 레시피 결과(형식 검사 포함). 형식이 깨졌으면 오류 */
+export function readInteraction(it, { durationSec = null } = {}) {
+  if (it.status !== 'completed') {
+    const e = new Error(`작업이 끝나지 못했어요(${it.status}${it.error?.message ? `: ${it.error.message}` : ''})`);
+    e.status = it.status;
+    throw e;
+  }
+  const rawText = interactionText(it);
+  const usage = interactionUsage(it);
+  if (!rawText) {
+    const e = new Error('빈 응답');
+    e.usage = usage;
+    throw e;
+  }
+  let v;
+  try {
+    v = validateResult(parseJson(rawText), { durationSec });
+  } catch (err) {
+    v = { ok: false, errors: [err.message] };
+  }
+  if (!v.ok) {
+    const e = new Error(`형식 오류: ${v.errors.join(', ')}`);
+    e.rawText = rawText;
+    e.usage = usage;
+    e.formatError = true;
+    throw e;
+  }
+  return { recipes: v.recipes, warnings: v.warnings, usage, rawText, finishReason: it.status };
 }
