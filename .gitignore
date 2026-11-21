@@ -1,0 +1,19 @@
+# 공개 저장소에는 앱 코드·프롬프트·소개만 올림(CLAUDE.md 7절).
+# 맨 위 폴더는 기본으로 전부 제외하고, 올릴 것만 아래에서 다시 허용함.
+/*
+!/.gitignore
+!/.nojekyll
+!/README.md
+!/app/
+!/prompts/
+
+# 허용한 폴더 안에서도 올리지 않을 것
+.env
+*백업*.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+*.log
